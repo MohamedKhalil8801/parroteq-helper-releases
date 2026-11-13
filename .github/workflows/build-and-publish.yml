@@ -1,0 +1,76 @@
+# Lives in MohamedKhalil8801/parroteq-helper-releases as .github/workflows/build-and-publish.yml.
+# Builds ParrotEQ Helper from the private parroteq repo and publishes a release here.
+# Secrets: SOURCE_REPO_TOKEN (read-only contents of parroteq), MINISIGN_KEY (the release key, hex).
+name: Build and publish
+on:
+  workflow_dispatch:
+    inputs:
+      ref: { description: "parroteq branch, tag or commit", required: true, default: "main" }
+      version: { description: "Version, X.Y.Z", required: true }
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, out: parroteq-helper.exe, asset: windows }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, out: parroteq-helper, asset: linux }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: MohamedKhalil8801/parroteq
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: The update key is built in
+        shell: bash
+        run: |
+          if grep -q 'pub const UPDATE_PUBKEY: &str = "";' helper/src/update.rs; then
+            echo "UPDATE_PUBKEY is empty: this release could never update itself." >&2; exit 1
+          fi
+      - name: Stamp the version
+        shell: bash
+        working-directory: helper
+        run: sed -i.bak "0,/^version = .*/s//version = \"${{ inputs.version }}\"/" Cargo.toml
+      - run: cargo test --release
+        working-directory: helper
+      - run: cargo build --release --target ${{ matrix.target }}
+        working-directory: helper
+      - name: Self-test
+        shell: bash
+        run: helper/target/${{ matrix.target }}/release/${{ matrix.out }} --version | grep -q "${{ inputs.version }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: helper/target/${{ matrix.target }}/release/${{ matrix.out }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: MohamedKhalil8801/parroteq
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with: { path: built }
+      - name: Assets
+        run: |
+          v=${{ inputs.version }}
+          mkdir dist
+          cp built/windows/parroteq-helper.exe "dist/ParrotEQ-Helper-$v-windows-x64.exe"
+          cp built/windows/parroteq-helper.exe "dist/ParrotEQ-Helper-windows-x64.exe"
+          cp built/linux/parroteq-helper dist/parroteq-helper-linux-x64
+          cp helper/release/install-linux.sh dist/
+          base="https://github.com/${{ github.repository }}/releases/download/v$v"
+          (cd helper && MINISIGN_KEY="${{ secrets.MINISIGN_KEY }}" cargo run --release --example release -- manifest "$v" ../dist "$base")
+          (cd dist && sha256sum * > SHA256SUMS)
+      - name: Publish
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: gh release create "v${{ inputs.version }}" dist/* --repo "${{ github.repository }}" --title "ParrotEQ Helper ${{ inputs.version }}" --notes "ParrotEQ Helper ${{ inputs.version }}. Download it from the ParrotEQ website."
